@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  lumina-proxy:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: lumina-proxy-engine
+    ports:
+      - "8080:8080"
+    environment:
+      # Boleh tukar-tukar konfigurasi kat sini tanpa sentuh code Go!
+      - LUMINA_UPSTREAM=https://jsonplaceholder.typicode.com
+      - LUMINA_PORT=8080
+      - LUMINA_CACHE_TTL_SECONDS=60
+    restart: unless-stopped
+    # Limitkan resources RAM/CPU untuk tunjuk ciri-ciri DevOps yang kemas
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 128M
