@@ -1,70 +1,103 @@
-# Project Context: Go-Lumina Proxy
+# 🚀 Go-Lumina Enterprise API Gateway
 
-## Project Overview
-**Go-Lumina** is a high-performance, enterprise-grade, in-memory caching reverse proxy written entirely in Golang. Its primary function is to sit in front of an upstream API server to drastically reduce latency, prevent upstream overload (cache stampedes), and save external bandwidth using advanced concurrent caching mechanisms.
+**Go-Lumina** is a production-ready, high-performance API Gateway and Distributed Caching Proxy written in Golang. It is designed to handle high-traffic environments by providing multi-level resilience, observability, and extreme efficiency.
 
-## Tech Stack & Dependencies
-*   **Language:** Go (1.26+)
-*   **Standard Library:** net/http, net/http/httputil, sync, sync/atomic, os/signal
-*   **LRU Cache:** github.com/hashicorp/golang-lru/v2
-*   **Concurrency Sync:** golang.org/x/sync/singleflight
-*   **Rate Limiting:** golang.org/x/time/rate
-*   **Deployment:** Docker (Multi-stage), Docker Compose (Scratch-based, < 5MB image)
+## ✨ Enterprise Features
 
-## Core Architecture & Enterprise Features
+- **⚖️ Round-Robin Load Balancing**: Automatically distributes traffic across multiple upstream servers with built-in **Active Health Checks**.
+- **🧠 Hybrid Caching (Distributed)**: Seamlessly switch between local **LRU Memory Cache** and **Redis Distributed Cache** for multi-instance scalability.
+- **🛡️ Circuit Breaker (Netflix Hystrix Style)**: Protects your infrastructure by "tripping" the circuit during upstream failures, preventing cascading outages.
+- **⚡ Stale-While-Revalidate (SWR)**: Delivers instant responses (0ms latency) using stale data while refreshing the cache in the background.
+- **🛡️ Anti-Cache Stampede (Singleflight)**: Ensures only ONE request reaches the upstream for a specific resource, even under massive concurrent load.
+- **📈 Deep Observability**: Native **Prometheus** metrics integration and pre-configured **Grafana** dashboards.
+- **bouncer IP-Based Rate Limiting**: Protects against DDoS and abusive clients using a Token Bucket algorithm.
+- **🐳 DevOps Ready**: Ultra-slim Docker images (< 10MB) and full `docker-compose` orchestration.
 
-### Architecture Overview
+---
+
+## 🏗️ Architecture
+
 ```mermaid
 graph TD
-    User["Users (Concurrent Requests)"] -->|Multiple Hits| Proxy["LuminaProxy"]
+    User["Users (Concurrent Requests)"] -->|Rate Limited| Proxy["LuminaProxy Engine"]
     
-    subgraph "Internal Logic"
-        Proxy --> Cache{"LRU Cache Check"}
-        Cache -- "HIT" --> Return["Serve instantly"]
-        Cache -- "STALE" --> SWR["SWR: Serve old data & refresh background"]
-        Cache -- "MISS" --> SF["Singleflight (Gatekeeper)"]
-        
-        SF --> |"1st Req"| Upstream["Upstream API"]
-        SF --> |"Other Req"| Wait["Wait for 1st Req result"]
-        
-        Upstream --> Success["Update Cache & Share"]
+    subgraph "Resilience Layer"
+        Proxy --> CB{"Circuit Breaker"}
+        CB -- "OPEN" --> Fallback["Serve Stale Fallback"]
+        CB -- "CLOSED" --> LB["Load Balancer"]
     end
     
-    Success --> Return
-    Wait --> Return
-    SWR --> Upstream
+    subgraph "Load Balancer"
+        LB -->|Round Robin| Target["Upstream Selection"]
+        Target -->|Health Check| U1["API Server 1"]
+        Target -->|Health Check| U2["API Server 2"]
+    end
+    
+    subgraph "Caching Engine"
+        Proxy --> Cache{"Cache Backend"}
+        Cache -- "HIT" --> Return["Serve Instantly"]
+        Cache -- "MISS" --> SF["Singleflight Gatekeeper"]
+        SF --> LB
+        Cache -- "STALE" --> SWR["SWR Background Refresh"]
+    end
+    
+    subgraph "Observability"
+        Proxy --> Prom["Prometheus /metrics"]
+        Prom --> Grafana["Grafana Dashboard"]
+    end
 ```
 
-### 1. In-Memory LRU Caching
-*   Caches only HTTP GET requests.
-*   Utilizes a thread-safe LRU (Least Recently Used) mapping structure capped at 2,000 items to prevent Out-Of-Memory (OOM) crashes.
-*   Uses sync.RWMutex to ensure race-condition-free reads and writes.
+---
 
-### 2. Singleflight (Anti-Cache Stampede)
-*   Integrates golang.org/x/sync/singleflight.
-*   If a cache MISS occurs and 10,000 users request the same endpoint simultaneously, LuminaProxy holds the subsequent requests, sends exactly ONE request to the upstream, and shares the single response with all waiting clients. 
+## 🛠️ Tech Stack
 
-### 3. Stale-While-Revalidate (SWR) Mechanism
-*   Implements a two-tier expiration system.
-*   If a request hits a "Stale" cache, the proxy instantly serves the stale data to the user (0 latency) while spawning a background Goroutine to fetch fresh data from the upstream.
+- **Core**: Go 1.26+, `net/http/httputil`
+- **Caching**: `github.com/hashicorp/golang-lru/v2`, `github.com/redis/go-redis/v9`
+- **Resilience**: Custom Circuit Breaker implementation, `golang.org/x/sync/singleflight`
+- **Observability**: `github.com/prometheus/client_golang`
+- **Infrastructure**: Docker, Redis, Prometheus, Grafana
 
-### 4. IP-Based Rate Limiting (Bouncer)
-*   Utilizes a Token Bucket algorithm.
-*   Limits each unique IP address to 500 requests/second with a burst capacity of 1,000. Over-limit requests are immediately dropped with a 429 Too Many Requests status.
+---
 
-### 5. Graceful Shutdown
-*   Listens for SIGINT/SIGTERM context signals to securely terminate the process.
+## 🚀 Quick Start (Docker Compose)
 
-### 6. Security & Observability
-*   **Security:** Bypasses caching entirely if the upstream response contains a Set-Cookie header.
-*   **Observability:** Exposes a JSON endpoint at /lumina-metrics displaying metrics.
+The easiest way to see Go-Lumina in action is using `docker-compose`. This will spin up the Proxy, Redis, Prometheus, and Grafana.
 
-## Performance Benchmarks (Localhost / Windows Environment)
-*   **Throughput:** Sustained ~5,000 to ~7,500 Requests Per Second (RPS).
-*   **Stress Test:** Successfully processed 1,000,000 requests in ~3 minutes using a custom worker-pool load tester.
-*   **Bandwidth Efficiency:** Handled 5,000 concurrent requests to a 1.5MB JSON endpoint, saving ~7.5GB of theoretical external bandwidth by fetching the 1.5MB exactly once.
+```bash
+# Clone and Run
+git clone https://github.com/AmiQT/LuminaProxy.git
+cd LuminaProxy
+docker-compose up --build
+```
 
-## Deployment (Dockerized)
-*   Built using Docker Multi-stage configuration.
-*   Compiled with CGO_ENABLED=0 GOOS=linux and compressed with UPX into a scratch-based container (< 5MB).
+### Access Points:
+- **Proxy Gateway**: `http://localhost:8080`
+- **Prometheus**: `http://localhost:9090`
+- **Grafana**: `http://localhost:3000` (Default: `admin/admin`)
+- **JSON Metrics**: `http://localhost:8080/lumina-metrics`
 
+---
+
+## ⚙️ Configuration (Environment Variables)
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `LUMINA_UPSTREAMS` | Comma-separated upstream URLs | `http://localhost:8081` |
+| `LUMINA_PORT` | Port the proxy listens on | `8080` |
+| `LUMINA_REDIS_URL` | Redis connection string (enables distributed cache) | `""` (Uses LRU) |
+| `LUMINA_CACHE_TTL_SECONDS` | Time to live for cache items | `300` |
+
+---
+
+## 📊 Observability & Metrics
+
+Go-Lumina exposes high-granularity metrics for SREs:
+- `lumina_requests_total`: Total requests processed.
+- `lumina_cache_hits_total`: Total successful cache hits.
+- `lumina_cache_misses_total`: Total cache misses.
+- `lumina_circuit_trips_total`: Number of times the circuit breaker has tripped.
+
+---
+
+## ⚖️ License
+MIT License. Created by **AmiQT**.

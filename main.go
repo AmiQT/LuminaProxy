@@ -13,28 +13,66 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	// "strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
 )
 
+// 0. Prometheus Metrics
+var (
+	promRequestsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "lumina_requests_total",
+		Help: "The total number of processed requests",
+	})
+	promCacheHits = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "lumina_cache_hits_total",
+		Help: "The total number of cache hits",
+	})
+	promCacheMisses = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "lumina_cache_misses_total",
+		Help: "The total number of cache misses",
+	})
+	promStaleRefreshes = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "lumina_stale_refreshes_total",
+		Help: "The total number of background stale refreshes",
+	})
+	promCircuitTrips = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "lumina_circuit_trips_total",
+		Help: "The total number of circuit breaker trips",
+	})
+)
+
 // 1. Struktur Data dengan Stale & Expires
 type CacheItem struct {
-	Body        []byte
-	ContentType string
-	StatusCode  int
-	CachedAt    time.Time
-	StaleAt     time.Time // Bila data ni dah basi (kena refresh secara sembunyi)
-	ExpiresAt   time.Time // Bila data ni dah mati terus (kena MISS)
+	Body        []byte    `json:"body"`
+	ContentType string    `json:"content_type"`
+	StatusCode  int       `json:"status_code"`
+	CachedAt    time.Time `json:"cached_at"`
+	StaleAt     time.Time `json:"stale_at"`
+	ExpiresAt   time.Time `json:"expires_at"`
 }
 
-// 2. Cache guna LRU + Metrics
+// 2. Cache Interface
+type CacheBackend interface {
+	GetStatus(key string) (CacheItem, string)
+	Add(key string, item CacheItem)
+	IncHits()
+	IncMisses()
+	IncStaleRefresh()
+	GetMetrics() map[string]interface{}
+}
+
+// 3. Cache guna LRU (Local Memory)
 type LuminaCache struct {
 	lru          *lru.Cache[string, CacheItem]
 	Hits         uint64
@@ -43,12 +81,10 @@ type LuminaCache struct {
 }
 
 func NewLuminaCache(maxItems int) *LuminaCache {
-	// LRU secara automatik menendang item lama bila RAM nak penuh!
 	cache, _ := lru.New[string, CacheItem](maxItems)
 	return &LuminaCache{lru: cache}
 }
 
-// Semak status Cache: HIT, STALE, atau MISS
 func (c *LuminaCache) GetStatus(key string) (CacheItem, string) {
 	item, found := c.lru.Get(key)
 	if !found {
@@ -59,9 +95,88 @@ func (c *LuminaCache) GetStatus(key string) (CacheItem, string) {
 		return CacheItem{}, "MISS"
 	}
 	if time.Now().After(item.StaleAt) {
-		return item, "STALE" // Basi, tapi masih boleh makan!
+		return item, "STALE"
 	}
 	return item, "HIT"
+}
+
+func (c *LuminaCache) Add(key string, item CacheItem) { c.lru.Add(key, item) }
+func (c *LuminaCache) IncHits()                       { atomic.AddUint64(&c.Hits, 1) }
+func (c *LuminaCache) IncMisses()                     { atomic.AddUint64(&c.Misses, 1) }
+func (c *LuminaCache) IncStaleRefresh()               { atomic.AddUint64(&c.StaleRefresh, 1) }
+
+func (c *LuminaCache) GetMetrics() map[string]interface{} {
+	return map[string]interface{}{
+		"type":              "LRU (Memory)",
+		"total_cache_items": c.lru.Len(),
+		"total_hits":        atomic.LoadUint64(&c.Hits),
+		"total_misses":      atomic.LoadUint64(&c.Misses),
+		"stale_refreshes":   atomic.LoadUint64(&c.StaleRefresh),
+	}
+}
+
+// 4. Redis Cache Implementation
+type RedisCache struct {
+	client       *redis.Client
+	Hits         uint64
+	Misses       uint64
+	StaleRefresh uint64
+}
+
+func NewRedisCache(redisURL string) (*RedisCache, error) {
+	opt, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, err
+	}
+	client := redis.NewClient(opt)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, err
+	}
+	return &RedisCache{client: client}, nil
+}
+
+func (c *RedisCache) GetStatus(key string) (CacheItem, string) {
+	ctx := context.Background()
+	val, err := c.client.Get(ctx, key).Bytes()
+	if err != nil {
+		return CacheItem{}, "MISS"
+	}
+	var item CacheItem
+	if err := json.Unmarshal(val, &item); err != nil {
+		return CacheItem{}, "MISS"
+	}
+	if time.Now().After(item.ExpiresAt) {
+		c.client.Del(ctx, key)
+		return CacheItem{}, "MISS"
+	}
+	if time.Now().After(item.StaleAt) {
+		return item, "STALE"
+	}
+	return item, "HIT"
+}
+
+func (c *RedisCache) Add(key string, item CacheItem) {
+	ctx := context.Background()
+	val, _ := json.Marshal(item)
+	ttl := time.Until(item.ExpiresAt)
+	if ttl > 0 {
+		c.client.Set(ctx, key, val, ttl)
+	}
+}
+
+func (c *RedisCache) IncHits()                       { atomic.AddUint64(&c.Hits, 1) }
+func (c *RedisCache) IncMisses()                     { atomic.AddUint64(&c.Misses, 1) }
+func (c *RedisCache) IncStaleRefresh()               { atomic.AddUint64(&c.StaleRefresh, 1) }
+
+func (c *RedisCache) GetMetrics() map[string]interface{} {
+	return map[string]interface{}{
+		"type":              "Redis",
+		"total_hits":        atomic.LoadUint64(&c.Hits),
+		"total_misses":      atomic.LoadUint64(&c.Misses),
+		"stale_refreshes":   atomic.LoadUint64(&c.StaleRefresh),
+	}
 }
 
 // 3. Rate Limiter: Bouncer Pintu (Elak DDoS dari 1 IP)
@@ -97,34 +212,214 @@ func (i *IPRateLimiter) GetLimiter(ip string) *rate.Limiter {
 	return limiter
 }
 
+// 4. Load Balancer & Health Check
+type Upstream struct {
+	URL   *url.URL
+	Alive bool
+	mu    sync.RWMutex
+}
+
+func (u *Upstream) IsAlive() bool {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.Alive
+}
+
+func (u *Upstream) SetAlive(alive bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.Alive = alive
+}
+
+type LoadBalancer struct {
+	upstreams []*Upstream
+	current   uint64
+}
+
+func NewLoadBalancer(urls []string) *LoadBalancer {
+	var upstreams []*Upstream
+	for _, u := range urls {
+		parsed, err := url.Parse(strings.TrimSpace(u))
+		if err == nil {
+			upstreams = append(upstreams, &Upstream{URL: parsed, Alive: true})
+		}
+	}
+	return &LoadBalancer{upstreams: upstreams}
+}
+
+func (lb *LoadBalancer) Next() *Upstream {
+	// Round Robin
+	for i := 0; i < len(lb.upstreams); i++ {
+		idx := atomic.AddUint64(&lb.current, 1) % uint64(len(lb.upstreams))
+		if lb.upstreams[idx].IsAlive() {
+			return lb.upstreams[idx]
+		}
+	}
+	return nil // Semua mati
+}
+
+func (lb *LoadBalancer) StartHealthCheck() {
+	go func() {
+		for {
+			for _, u := range lb.upstreams {
+				go func(upstream *Upstream) {
+					client := http.Client{Timeout: 2 * time.Second}
+					resp, err := client.Get(upstream.URL.String())
+					if err != nil || resp.StatusCode >= 500 {
+						if upstream.IsAlive() {
+							fmt.Printf("[HEALTH] ❌ Upstream DEAD: %s\n", upstream.URL.String())
+							upstream.SetAlive(false)
+						}
+					} else {
+						if !upstream.IsAlive() {
+							fmt.Printf("[HEALTH] ✅ Upstream ALIVE: %s\n", upstream.URL.String())
+							upstream.SetAlive(true)
+						}
+					}
+					if resp != nil {
+						resp.Body.Close()
+					}
+				}(u)
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}()
+}
+
+// 5. Circuit Breaker: Pelindung Downstream (Netflix Hystrix style)
+type CBState int
+
+const (
+	StateClosed CBState = iota
+	StateOpen
+	StateHalfOpen
+)
+
+type CircuitBreaker struct {
+	failureThreshold int
+	failureCount     int
+	state            CBState
+	lastFailure      time.Time
+	resetTimeout     time.Duration
+	mu               sync.RWMutex
+}
+
+func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		failureThreshold: threshold,
+		state:            StateClosed,
+		resetTimeout:     timeout,
+	}
+}
+
+func (cb *CircuitBreaker) AllowRequest() bool {
+	cb.mu.RLock()
+	if cb.state == StateClosed {
+		cb.mu.RUnlock()
+		return true
+	}
+	if cb.state == StateOpen {
+		if time.Since(cb.lastFailure) > cb.resetTimeout {
+			cb.mu.RUnlock()
+			cb.mu.Lock()
+			cb.state = StateHalfOpen
+			cb.mu.Unlock()
+			return true
+		}
+		cb.mu.RUnlock()
+		return false
+	}
+	// Half-Open
+	cb.mu.RUnlock()
+	return true
+}
+
+func (cb *CircuitBreaker) RecordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failureCount = 0
+	cb.state = StateClosed
+}
+
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failureCount++
+	cb.lastFailure = time.Now()
+	if cb.failureCount >= cb.failureThreshold {
+		if cb.state != StateOpen {
+			fmt.Println("[CIRCUIT] 🚨 Trip! Circuit is now OPEN.")
+			promCircuitTrips.Inc()
+		}
+		cb.state = StateOpen
+	}
+}
+
 var serverStartTime = time.Now()
 
 func main() {
-	defaultUpstream := "https://jsonplaceholder.typicode.com"
-	portFlag := flag.String("port", "8080", "Proxy listening port")
+	defaultUpstreams := os.Getenv("LUMINA_UPSTREAMS")
+	if defaultUpstreams == "" {
+		defaultUpstreams = os.Getenv("LUMINA_UPSTREAM") // fallback untuk backward compatibility
+	}
+	if defaultUpstreams == "" {
+		defaultUpstreams = "https://jsonplaceholder.typicode.com"
+	}
+
+	defaultPort := os.Getenv("LUMINA_PORT")
+	if defaultPort == "" {
+		defaultPort = "8080"
+	}
+
+	upstreamsFlag := flag.String("upstreams", defaultUpstreams, "Comma-separated upstream URLs")
+	portFlag := flag.String("port", defaultPort, "Proxy listening port")
 	ttlFlag := flag.Int("ttl", 60, "Cache TTL (Expires) in seconds")
 	staleFlag := flag.Int("stale", 30, "Cache Stale in seconds")
 	flag.Parse()
 
-	upstreamURL, err := url.Parse(defaultUpstream)
-	if err != nil {
-		log.Fatalf("invalid upstream URL: %v", err)
+	urls := strings.Split(*upstreamsFlag, ",")
+	lb := NewLoadBalancer(urls)
+	if len(lb.upstreams) == 0 {
+		log.Fatalf("Tiada upstream URL yang valid!")
 	}
+	lb.StartHealthCheck()
 
 	ttl := time.Duration(*ttlFlag) * time.Second
 	staleTTL := time.Duration(*staleFlag) * time.Second
 
-	// Setup LRU Max 2000 item (Cukup untuk kawal RAM)
-	cache := NewLuminaCache(2000)
-
+	// Setup Cache (Redis or LRU Memory)
+	var cache CacheBackend
+	redisURL := os.Getenv("LUMINA_REDIS_URL")
+	if redisURL != "" {
+		fmt.Printf("🔄 Memulakan sambungan ke Redis: %s\n", redisURL)
+		rCache, err := NewRedisCache(redisURL)
+		if err != nil {
+			log.Fatalf("Gagal sambung ke Redis: %v", err)
+		}
+		cache = rCache
+	} else {
+		fmt.Println("🚀 Menggunakan LRU Cache (Local Memory)")
+		cache = NewLuminaCache(2000) // LRU Max 2000 items
+	}
 	// Setup Rate Limiter (Max 10000 request sesaat per IP, Burst 15000)
 	limiter := NewIPRateLimiter(10000, 15000)
 
-	proxy := httputil.NewSingleHostReverseProxy(upstreamURL)
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.Host = upstreamURL.Host
+	// Setup Circuit Breaker (Threshold 5 kegagalan, Reset selepas 10 saat)
+	cb := NewCircuitBreaker(5, 10*time.Second)
+
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			target := lb.Next()
+			if target == nil {
+				req.URL.Scheme = "http"
+				req.URL.Host = "offline.local"
+				req.Host = "offline.local"
+				return
+			}
+			req.URL.Scheme = target.URL.Scheme
+			req.URL.Host = target.URL.Host
+			req.Host = target.URL.Host
+		},
 	}
 
 	var requestGroup singleflight.Group
@@ -147,13 +442,16 @@ func main() {
 		}
 
 		if res.Header.Get("Set-Cookie") == "" && res.StatusCode >= 200 && res.StatusCode < 300 && len(body) > 0 {
-			cache.lru.Add(cacheKey, item)
+			cache.Add(cacheKey, item)
+			cb.RecordSuccess()
+		} else if res.StatusCode >= 500 {
+			cb.RecordFailure()
 		}
 		return item, nil
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// start := time.Now()
+		promRequestsTotal.Inc()
 
 		// 1. Rate Limiting Check
 		ip, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -165,16 +463,16 @@ func main() {
 			return
 		}
 
-		// 2. Metrics Endpoint
+		// 2. Metrics Endpoint (Prometheus / JSON Fallback)
+		if r.URL.Path == "/metrics" {
+			promhttp.Handler().ServeHTTP(w, r)
+			return
+		}
 		if r.URL.Path == "/lumina-metrics" {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"uptime_seconds":    time.Since(serverStartTime).Seconds(),
-				"total_cache_items": cache.lru.Len(),
-				"total_hits":        atomic.LoadUint64(&cache.Hits),
-				"total_misses":      atomic.LoadUint64(&cache.Misses),
-				"stale_refreshes":   atomic.LoadUint64(&cache.StaleRefresh),
-			})
+			metrics := cache.GetMetrics()
+			metrics["uptime_seconds"] = time.Since(serverStartTime).Seconds()
+			json.NewEncoder(w).Encode(metrics)
 			return
 		}
 
@@ -184,19 +482,35 @@ func main() {
 			return
 		}
 
-		cacheKey := upstreamURL.String() + ":" + r.URL.RequestURI()
+		cacheKey := "lumina:" + r.URL.RequestURI()
 		item, status := cache.GetStatus(cacheKey)
 
-		// 3. HIT & STALE-WHILE-REVALIDATE Logic
+		// 3. Circuit Breaker Check
+		if !cb.AllowRequest() {
+			// Kalau circuit OPEN, cuba serve stale data kalau ada
+			if status == "STALE" || status == "HIT" {
+				w.Header().Set("Content-Type", item.ContentType)
+				w.Header().Set("X-Lumina-Cache", status+"-CB")
+				w.WriteHeader(item.StatusCode)
+				_, _ = w.Write(item.Body)
+				return
+			}
+			http.Error(w, "503 Service Unavailable - Circuit Open!", http.StatusServiceUnavailable)
+			return
+		}
+
+		// 4. HIT & STALE-WHILE-REVALIDATE Logic
 		if status == "HIT" || status == "STALE" {
 			w.Header().Set("Content-Type", item.ContentType)
 			w.Header().Set("X-Lumina-Cache", status)
 
 			if status == "HIT" {
-				atomic.AddUint64(&cache.Hits, 1)
+				cache.IncHits()
+				promCacheHits.Inc()
 				// fmt.Printf("[HIT  ] %s %s | %d µs\n", r.Method, r.URL.RequestURI(), time.Since(start).Microseconds())
 			} else {
-				atomic.AddUint64(&cache.StaleRefresh, 1)
+				cache.IncStaleRefresh()
+				promStaleRefreshes.Inc()
 				// fmt.Printf("[STALE] %s %s | serving old data & refreshing background! | %d µs\n", r.Method, r.URL.RequestURI(), time.Since(start).Microseconds())
 
 				// Stale: Jalan background fetch supaya user seterusnya dapat data baru
@@ -215,7 +529,8 @@ func main() {
 
 		// 4. MISS dengan Singleflight
 		v, err, shared := requestGroup.Do(cacheKey, func() (interface{}, error) {
-			atomic.AddUint64(&cache.Misses, 1)
+			cache.IncMisses()
+			promCacheMisses.Inc()
 			return fetchAndUpdateCache(r, cacheKey)
 		})
 
@@ -229,7 +544,8 @@ func main() {
 
 		if shared {
 			w.Header().Set("X-Lumina-Cache", "HIT-SHARED")
-			atomic.AddUint64(&cache.Hits, 1)
+			cache.IncHits()
+			promCacheHits.Inc()
 			// fmt.Printf("[SAVED] %s %s | %d ms\n", r.Method, r.URL.RequestURI(), time.Since(start).Milliseconds())
 		} else {
 			w.Header().Set("X-Lumina-Cache", "MISS")

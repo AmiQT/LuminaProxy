@@ -10,13 +10,48 @@ services:
       - "8080:8080"
     environment:
       # Boleh tukar-tukar konfigurasi kat sini tanpa sentuh code Go!
-      - LUMINA_UPSTREAM=https://jsonplaceholder.typicode.com
+      # Guna comma untuk multiple upstreams (Load Balancing)
+      - LUMINA_UPSTREAMS=https://jsonplaceholder.typicode.com,https://dummyjson.com
       - LUMINA_PORT=8080
       - LUMINA_CACHE_TTL_SECONDS=60
+      # Buang komen ni untuk aktifkan Redis Cache (Distributed)
+      - LUMINA_REDIS_URL=redis://lumina-redis:6379/0
     restart: unless-stopped
+    depends_on:
+      - lumina-redis
     # Limitkan resources RAM/CPU untuk tunjuk ciri-ciri DevOps yang kemas
     deploy:
       resources:
         limits:
           cpus: '0.50'
           memory: 128M
+
+  lumina-redis:
+    image: redis:7-alpine
+    container_name: lumina-redis-cache
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: lumina-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: lumina-grafana
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
