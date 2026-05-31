@@ -1,21 +1,21 @@
-# 🚀 Go-Lumina Enterprise API Gateway
+# Go-Lumina Enterprise API Gateway
 
 **Go-Lumina** is a production-ready, high-performance API Gateway and Distributed Caching Proxy written in Golang. It is designed to handle high-traffic environments by providing multi-level resilience, observability, and extreme efficiency.
 
-## ✨ Enterprise Features
+## Enterprise Features
 
-- **⚖️ Round-Robin Load Balancing**: Automatically distributes traffic across multiple upstream servers with built-in **Active Health Checks**.
-- **🧠 Hybrid Caching (Distributed)**: Seamlessly switch between local **LRU Memory Cache** and **Redis Distributed Cache** for multi-instance scalability.
-- **🛡️ Circuit Breaker (Netflix Hystrix Style)**: Protects your infrastructure by "tripping" the circuit during upstream failures, preventing cascading outages.
-- **⚡ Stale-While-Revalidate (SWR)**: Delivers instant responses (0ms latency) using stale data while refreshing the cache in the background.
-- **🛡️ Anti-Cache Stampede (Singleflight)**: Ensures only ONE request reaches the upstream for a specific resource, even under massive concurrent load.
-- **📈 Deep Observability**: Native **Prometheus** metrics integration and pre-configured **Grafana** dashboards.
-- **bouncer IP-Based Rate Limiting**: Protects against DDoS and abusive clients using a Token Bucket algorithm.
-- **🐳 DevOps Ready**: Ultra-slim Docker images (< 10MB) and full `docker-compose` orchestration.
+- **Round-Robin Load Balancing**: Automatically distributes traffic across multiple upstream servers with built-in **Active Health Checks**.
+- **Hybrid Caching (Distributed)**: Seamlessly switch between local **LRU Memory Cache** and **Redis Distributed Cache** for multi-instance scalability.
+- **Circuit Breaker (Netflix Hystrix Style)**: Protects your infrastructure by "tripping" the circuit during upstream failures, preventing cascading outages.
+- **Stale-While-Revalidate (SWR)**: Delivers instant responses (0ms latency) using stale data while refreshing the cache in the background.
+- **Anti-Cache Stampede (Singleflight)**: Ensures only ONE request reaches the upstream for a specific resource, even under massive concurrent load.
+- **Deep Observability**: Native **Prometheus** metrics integration and pre-configured **Grafana** dashboards.
+- **IP-Based Rate Limiting**: Protects against DDoS and abusive clients using a Token Bucket algorithm.
+- **DevOps Ready**: Ultra-slim Docker images (< 10MB) and full `docker-compose` orchestration.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```mermaid
 graph TD
@@ -49,7 +49,7 @@ graph TD
 
 ---
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 - **Core**: Go 1.26+, `net/http/httputil`
 - **Caching**: `github.com/hashicorp/golang-lru/v2`, `github.com/redis/go-redis/v9`
@@ -59,7 +59,7 @@ graph TD
 
 ---
 
-## 🚀 Quick Start (Docker Compose)
+## Quick Start (Docker Compose)
 
 The easiest way to see Go-Lumina in action is using `docker-compose`. This will spin up the Proxy, Redis, Prometheus, and Grafana.
 
@@ -78,7 +78,7 @@ docker-compose up --build
 
 ---
 
-## ⚙️ Configuration (Environment Variables)
+## Configuration (Environment Variables)
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
@@ -89,7 +89,7 @@ docker-compose up --build
 
 ---
 
-## 📊 Observability & Metrics
+## Observability and Metrics
 
 Go-Lumina exposes high-granularity metrics for SREs:
 - `lumina_requests_total`: Total requests processed.
@@ -99,5 +99,5 @@ Go-Lumina exposes high-granularity metrics for SREs:
 
 ---
 
-## ⚖️ License
+## License
 MIT License. Created by **AmiQT**.
